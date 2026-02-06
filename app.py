@@ -83,4 +83,3 @@ def generate_crest(order_id):
 # ---------- ROUTES ----------
 
 @app.route("/")
-d
