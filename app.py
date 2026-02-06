@@ -29,4 +29,7 @@ def generate_crest(order_id):
 
     filename = f"crest_{order_id}.png"
     output
+@app.route("/routes")
+def routes():
+    return "<pre>" + "\n".join(sorted([str(r) for r in app.url_map.iter_rules()])) + "</pre>"
 
