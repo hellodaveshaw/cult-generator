@@ -1,5 +1,8 @@
 import os
 import random
+import hmac
+import base64
+import hashlib
 from datetime import datetime
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -21,6 +24,13 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 GENERATED_DIR = os.path.join(STATIC_DIR, "generated")
 
 os.makedirs(GENERATED_DIR, exist_ok=True)
+
+# ----------------------------
+# Config (Shopify)
+# ----------------------------
+# Put your Shopify App "Client secret" (aka API secret key) in Render as an env var:
+#   SHOPIFY_WEBHOOK_SECRET=xxxxx
+SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "").strip()
 
 # ----------------------------
 # Helpers
@@ -57,6 +67,27 @@ def safe_host_url() -> str:
     return url
 
 
+def verify_shopify_hmac(raw_body: bytes, hmac_header: str, secret: str) -> bool:
+    """
+    Verifies X-Shopify-Hmac-Sha256 against the raw request body.
+    Shopify sends base64(hmac_sha256(secret, body)).
+    """
+    if not secret:
+        # If you haven't set the secret yet, fail closed (safer).
+        return False
+    if not hmac_header:
+        return False
+
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).digest()
+
+    computed = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(computed, hmac_header)
+
+
 def generate_crest(order_id: str) -> tuple[str, str]:
     """
     Creates a crest PNG and saves it in static/generated.
@@ -80,8 +111,7 @@ def generate_crest(order_id: str) -> tuple[str, str]:
     if random.random() < 0.5:
         sigil = ImageOps.mirror(sigil)
 
-    # --- Colour palette (RGB is fine because you're doing digital downloads)
-    # You can replace these with your exact brand swatches
+    # --- Colour palette (replace with your exact brand swatches if you want)
     palette = [
         (0, 0, 0, 255),          # black
         (255, 255, 0, 255),      # yellow
@@ -92,25 +122,21 @@ def generate_crest(order_id: str) -> tuple[str, str]:
         (255, 255, 255, 255),    # white (useful for inverse)
     ]
 
-    # Pick two different colours for overlay logic
     sigil_colour = random.choice(palette)
     bg_colour = random.choice([c for c in palette if c != sigil_colour])
 
     # --- Recolour sigil by tinting its alpha mask
-    # Keeps crisp shapes. Assumes sigil art is solid/mono shapes.
     alpha = sigil.split()[-1]
     coloured_sigil = Image.new("RGBA", sigil.size, sigil_colour)
     coloured_sigil.putalpha(alpha)
 
-    # --- Optional: add a coloured field behind shield (evokes “heraldry”)
-    # If your shield already includes a border, this reads nicely.
+    # --- Optional: add a coloured field behind shield
     background = Image.new("RGBA", shield.size, bg_colour)
 
     # Compose: background -> shield -> sigil centered
     canvas = Image.alpha_composite(background, shield)
 
-    # Fit sigil nicely inside shield (tweak this once you see your real assets)
-    # Scale sigil to ~60% of shield width/height, preserving aspect.
+    # Fit sigil nicely inside shield
     max_w = int(shield.size[0] * 0.62)
     max_h = int(shield.size[1] * 0.62)
     coloured_sigil.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
@@ -143,7 +169,13 @@ def home():
 def routes():
     # Quick sanity check endpoint
     return (
-        "/\n/routes\n/new-order\n/preview/<filename>\n/download/<filename>\n/static/\n",
+        "/\n"
+        "/routes\n"
+        "/new-order\n"
+        "/webhook/order-paid\n"
+        "/preview/<filename>\n"
+        "/download/<filename>\n"
+        "/static/\n",
         200,
         {"Content-Type": "text/plain; charset=utf-8"},
     )
@@ -151,6 +183,9 @@ def routes():
 
 @app.post("/new-order")
 def new_order():
+    """
+    Manual/test endpoint (your curl).
+    """
     data = request.get_json(silent=True) or {}
     order_id = str(data.get("id") or "").strip()
     if not order_id:
@@ -176,6 +211,48 @@ def new_order():
     )
 
 
+@app.post("/webhook/order-paid")
+def webhook_order_paid():
+    """
+    Shopify Webhook endpoint.
+    In Shopify Admin/Webhooks or your app webhook config, set URL to:
+      https://cult-generator.onrender.com/webhook/order-paid
+    """
+    raw = request.get_data(cache=False)  # raw bytes for HMAC validation
+    shopify_hmac = request.headers.get("X-Shopify-Hmac-Sha256", "")
+
+    # Verify webhook authenticity (strongly recommended)
+    if not verify_shopify_hmac(raw, shopify_hmac, SHOPIFY_WEBHOOK_SECRET):
+        return jsonify({"status": "error", "message": "Invalid webhook signature"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    order_id = str(payload.get("id") or "").strip()
+    if not order_id:
+        return jsonify({"status": "error", "message": "Missing order id in webhook"}), 400
+
+    try:
+        _, filename = generate_crest(order_id)
+    except Exception as e:
+        # Return 500 so Shopify may retry (useful if assets temporarily missing)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    base = safe_host_url()
+    preview_url = f"{base}preview/{filename}"
+    download_url = f"{base}download/{filename}"
+
+    # IMPORTANT: Shopify just needs a 200 OK to stop retrying.
+    # You can extend this later to write the URL back onto the order via Admin API.
+    return jsonify(
+        {
+            "status": "generated",
+            "order_id": order_id,
+            "file": filename,
+            "preview_url": preview_url,
+            "download_url": download_url,
+        }
+    ), 200
+
+
 @app.get("/preview/<path:filename>")
 def preview(filename):
     # Inline display (browser shows image)
@@ -191,4 +268,3 @@ def download(filename):
 if __name__ == "__main__":
     # Local dev only; Render runs gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
-
