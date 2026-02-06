@@ -8,8 +8,9 @@ import requests
 app = Flask(__name__)
 
 # ---- SETTINGS ----
-SHIELD_FOLDER = "assets/shields"
-SIGIL_FOLDER = "assets/sigils"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SHIELD_FOLDER = os.path.join(BASE_DIR, "assets", "shields")
+SIGIL_FOLDER = os.path.join(BASE_DIR, "assets", "sigils")
 
 COLOURS = [
     (0,0,0),        # black
