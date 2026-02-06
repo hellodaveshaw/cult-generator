@@ -41,8 +41,17 @@ def generate_crest(order_id):
     # deterministic seed
     seed = int(hashlib.sha256(order_id.encode()).hexdigest(), 16)
 
-    shields = os.listdir(SHIELD_FOLDER)
-    sigils = os.listdir(SIGIL_FOLDER)
+def list_images(folder):
+    exts = (".png", ".jpg", ".jpeg")
+    return [f for f in os.listdir(folder) if f.lower().endswith(exts)]
+
+shields = list_images(SHIELD_FOLDER)
+sigils = list_images(SIGIL_FOLDER)
+
+if not shields:
+    raise Exception("No image files found in assets/shields (PNG/JPG only)")
+if not sigils:
+    raise Exception("No image files found in assets/sigils (PNG/JPG only)")
 
     random.seed(seed)
     shield_file = random.choice(shields)
