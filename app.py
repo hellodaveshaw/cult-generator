@@ -66,6 +66,67 @@ def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
     ).digest()
     computed = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(computed, hmac_header or "")
+import os, time, requests
+
+SHOP = os.environ["SHOPIFY_SHOP"]  # e.g. "cultofcustoms.myshopify.com"
+CLIENT_ID = os.environ["SHOPIFY_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]
+
+_token_cache = {"access_token": None, "expires_at": 0}
+
+def get_shopify_access_token() -> str:
+    now = int(time.time())
+    if _token_cache["access_token"] and now < _token_cache["expires_at"] - 60:
+        return _token_cache["access_token"]
+
+    url = f"https://{SHOP}/admin/oauth/access_token"
+    resp = requests.post(
+        url,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Shopify docs show expires_in = 86399 (24h)
+    _token_cache["access_token"] = data["access_token"]
+    _token_cache["expires_at"] = now + int(data.get("expires_in", 86399))
+    return _token_cache["access_token"]
+
+def shopify_graphql(query: str, variables: dict):
+    token = get_shopify_access_token()
+    url = f"https://{SHOP}/admin/api/2024-10/graphql.json"
+    r = requests.post(
+        url,
+        json={"query": query, "variables": variables},
+        headers={
+            "X-Shopify-Access-Token": token,
+            "Content-Type": "application/json",
+        },
+        timeout=20,
+    )
+
+    # If token expired early or scopes changed, refresh once
+    if r.status_code == 401:
+        _token_cache["access_token"] = None
+        token = get_shopify_access_token()
+        r = requests.post(
+            url,
+            json={"query": query, "variables": variables},
+            headers={
+                "X-Shopify-Access-Token": token,
+                "Content-Type": "application/json",
+            },
+            timeout=20,
+        )
+
+    r.raise_for_status()
+    return r.json()
 
 
 def shopify_graphql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
