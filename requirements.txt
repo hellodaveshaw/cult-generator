@@ -2,3 +2,4 @@ flask
 gunicorn
 Pillow
 requests
+boto3
