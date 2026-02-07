@@ -3,3 +3,4 @@ gunicorn
 Pillow
 requests
 boto3
+botocore
