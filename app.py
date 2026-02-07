@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import time
 from typing import Any, Dict, Optional
 
 import boto3
@@ -18,16 +19,17 @@ app = Flask(__name__)
 # ----------------------------
 # Env vars (Render)
 # ----------------------------
-SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN", "").strip()
-SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "").strip()  # e.g. "cultofcustoms.co.uk" (no https)
+SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()  # e.g. "cultofcustoms.myshopify.com"
+SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip()
+SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip()
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
-SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-01").strip()
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-10").strip()
 
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
-R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")  # e.g. "https://pub-xxxx.r2.dev"
+R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 
 # ----------------------------
@@ -36,8 +38,9 @@ R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")  # 
 def _require_env() -> None:
     missing = []
     for k in [
-        "SHOPIFY_ADMIN_TOKEN",
-        "SHOPIFY_STORE_DOMAIN",
+        "SHOPIFY_SHOP",
+        "SHOPIFY_CLIENT_ID",
+        "SHOPIFY_CLIENT_SECRET",
         "SHOPIFY_WEBHOOK_SECRET",
         "SHOPIFY_API_VERSION",
         "R2_ACCESS_KEY_ID",
@@ -54,8 +57,7 @@ def _require_env() -> None:
 
 def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
     """
-    Shopify sends X-Shopify-Hmac-Sha256 which is:
-    base64( HMAC_SHA256(secret, raw_body) )
+    Shopify sends X-Shopify-Hmac-Sha256 = base64(HMAC_SHA256(secret, raw_body))
     """
     if not SHOPIFY_WEBHOOK_SECRET:
         return False
@@ -66,99 +68,77 @@ def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
     ).digest()
     computed = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(computed, hmac_header or "")
-import os, time, requests
 
-SHOP = os.environ["SHOPIFY_SHOP"]  # e.g. "cultofcustoms.myshopify.com"
-CLIENT_ID = os.environ["SHOPIFY_CLIENT_ID"]
-CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]
 
+# ---- Shopify token via client credentials (cached) ----
 _token_cache = {"access_token": None, "expires_at": 0}
 
+
 def get_shopify_access_token() -> str:
+    _require_env()
+
     now = int(time.time())
     if _token_cache["access_token"] and now < _token_cache["expires_at"] - 60:
         return _token_cache["access_token"]
 
-    url = f"https://{SHOP}/admin/oauth/access_token"
+    url = f"https://{SHOPIFY_SHOP}/admin/oauth/access_token"
     resp = requests.post(
         url,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data={
             "grant_type": "client_credentials",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
+            "client_id": SHOPIFY_CLIENT_ID,
+            "client_secret": SHOPIFY_CLIENT_SECRET,
         },
-        timeout=15,
+        timeout=20,
     )
     resp.raise_for_status()
     data = resp.json()
 
-    # Shopify docs show expires_in = 86399 (24h)
     _token_cache["access_token"] = data["access_token"]
     _token_cache["expires_at"] = now + int(data.get("expires_in", 86399))
     return _token_cache["access_token"]
 
-def shopify_graphql(query: str, variables: dict):
+
+def shopify_graphql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     token = get_shopify_access_token()
-    url = f"https://{SHOP}/admin/api/2024-10/graphql.json"
+    url = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+
     r = requests.post(
         url,
-        json={"query": query, "variables": variables},
+        json={"query": query, "variables": variables or {}},
         headers={
             "X-Shopify-Access-Token": token,
             "Content-Type": "application/json",
         },
-        timeout=20,
+        timeout=30,
     )
 
-    # If token expired early or scopes changed, refresh once
+    # refresh once if 401
     if r.status_code == 401:
         _token_cache["access_token"] = None
         token = get_shopify_access_token()
         r = requests.post(
             url,
-            json={"query": query, "variables": variables},
+            json={"query": query, "variables": variables or {}},
             headers={
                 "X-Shopify-Access-Token": token,
                 "Content-Type": "application/json",
             },
-            timeout=20,
+            timeout=30,
         )
 
     r.raise_for_status()
-    return r.json()
-
-
-def shopify_graphql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not SHOPIFY_ADMIN_TOKEN or not SHOPIFY_STORE_DOMAIN:
-        raise RuntimeError("Missing SHOPIFY_ADMIN_TOKEN or SHOPIFY_STORE_DOMAIN")
-
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-    }
-    payload = {"query": query, "variables": variables or {}}
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
     data = r.json()
-    # Shopify GraphQL may include top-level errors
     if "errors" in data and data["errors"]:
         raise RuntimeError(f"Shopify GraphQL errors: {data['errors']}")
     return data
 
 
+# ---- R2 helpers ----
 def make_r2_client():
-    """
-    Cloudflare R2 is S3-compatible.
-    Endpoint is: https://<accountid>.r2.cloudflarestorage.com
-    Region can be "auto".
-    """
-    if not (R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_ACCOUNT_ID):
-        raise RuntimeError("Missing R2 credentials")
-
+    _require_env()
     endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-
     return boto3.client(
         "s3",
         region_name="auto",
@@ -170,12 +150,7 @@ def make_r2_client():
 
 
 def upload_png_to_r2(png_bytes: bytes, object_key: str) -> str:
-    """
-    Upload to R2 bucket and return public URL based on R2_PUBLIC_BASE_URL.
-    Requires bucket to have Public Development URL enabled (which you did).
-    """
     s3 = make_r2_client()
-
     s3.put_object(
         Bucket=R2_BUCKET,
         Key=object_key,
@@ -183,26 +158,17 @@ def upload_png_to_r2(png_bytes: bytes, object_key: str) -> str:
         ContentType="image/png",
         CacheControl="public, max-age=31536000, immutable",
     )
-
     return f"{R2_PUBLIC_BASE_URL}/{object_key}"
 
 
+# ---- Order extraction ----
 def extract_order_id(payload: Dict[str, Any]) -> str:
-    """
-    Your logs show an integer order ID (e.g. 820982911946154508).
-    Shopify webhooks also include 'id' and 'admin_graphql_api_id'.
-    We'll prefer 'id' for filename and 'admin_graphql_api_id' for GraphQL updates.
-    """
-    # Prefer numeric id if present
     if "id" in payload:
         return str(payload["id"])
-
-    # fallback: pull digits from admin_graphql_api_id
     gid = payload.get("admin_graphql_api_id", "")
     m = re.search(r"(\d+)$", gid)
     if m:
         return m.group(1)
-
     raise ValueError("Could not extract order id from webhook payload")
 
 
@@ -213,17 +179,12 @@ def extract_order_gid(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# ---- Crest generator ----
 def generate_crest_png(order_id: str) -> bytes:
-    """
-    Replace this with your real crest generator.
-    For now: black canvas with a simple shield mark (placeholder).
-    Output: PNG bytes.
-    """
     size = 1024
     img = Image.new("RGBA", (size, size), (0, 0, 0, 255))
     draw = ImageDraw.Draw(img)
 
-    # Simple shield placeholder
     cx, cy = size // 2, size // 2
     w, h = 220, 260
     shield = [
@@ -235,7 +196,6 @@ def generate_crest_png(order_id: str) -> bytes:
     ]
     draw.polygon(shield, outline=(255, 255, 255, 255), width=12)
 
-    # Yellow "crest" shape inside
     inner = [
         (cx - 70, cy - 40),
         (cx + 70, cy - 40),
@@ -245,32 +205,17 @@ def generate_crest_png(order_id: str) -> bytes:
     ]
     draw.polygon(inner, fill=(255, 215, 0, 255))
 
-    # Optional: tiny id marker (comment out if you don't want it)
-    # draw.text((20, size - 60), f"order {order_id}", fill=(255, 255, 255, 120))
-
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
 def write_order_metafield(order_gid: str, crest_url: str) -> None:
-    """
-    Writes: namespace 'cult', key 'crest_url'
-    Type: single_line_text_field
-    """
     mutation = """
     mutation SetCrestUrl($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) {
-        metafields {
-          id
-          namespace
-          key
-          value
-        }
-        userErrors {
-          field
-          message
-        }
+        metafields { id namespace key value }
+        userErrors { field message }
       }
     }
     """
@@ -297,20 +242,15 @@ def write_order_metafield(order_gid: str, crest_url: str) -> None:
 # ----------------------------
 @app.get("/")
 def home():
-    return jsonify(
-        {
-            "ok": True,
-            "service": "cult-generator",
-            "version": "v2-r2-metafield",
-        }
-    )
+    return jsonify({"ok": True, "service": "cult-generator", "version": "v3-client-credentials"})
 
 
 @app.get("/health")
 def health():
-    # basic sanity check without leaking secrets
     try:
         _require_env()
+        # also prove we can mint a token (doesn't leak it)
+        _ = get_shopify_access_token()
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -332,32 +272,22 @@ def webhook_order_paid():
     order_id = extract_order_id(payload)
     order_gid = extract_order_gid(payload)
 
-    # 1) Generate PNG
     png_bytes = generate_crest_png(order_id)
 
-    # 2) Upload to R2
     object_key = f"crest_{order_id}.png"
     crest_url = upload_png_to_r2(png_bytes, object_key)
 
-    # 3) Write URL back to Shopify order (metafield)
     if order_gid:
         write_order_metafield(order_gid, crest_url)
-
-    print(f"Order paid received: {order_id}")
-    print(f"Uploaded to R2: {crest_url}")
 
     return jsonify({"ok": True, "order_id": order_id, "crest_url": crest_url})
 
 
 @app.get("/crest/<order_id>.png")
 def crest_redirect(order_id: str):
-    """
-    Convenience: redirect to the public R2 URL for this order's crest.
-    """
     url = f"{R2_PUBLIC_BASE_URL}/crest_{order_id}.png"
     return redirect(url, code=302)
 
 
 if __name__ == "__main__":
-    # Local dev only
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
