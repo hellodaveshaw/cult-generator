@@ -16,53 +16,55 @@ from PIL import Image, ImageDraw
 
 app = Flask(__name__)
 
-# ============================================================
-# ENV VARS (Render)
-# ============================================================
-SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()  # e.g. "cultofcustoms.myshopify.com" (fallback)
+# ----------------------------
+# Env vars (Render)
+# ----------------------------
+# Shopify (2026+ client-credentials flow)
+SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()  # MUST be "cultofcustoms.myshopify.com"
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip()
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip()
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-01").strip()
 
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
+# Cloudflare R2 (S3-compatible)
 R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
-R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")  # e.g. "https://pub-xxxx.r2.dev"
+R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")
+R2_ENDPOINT = os.getenv("R2_ENDPOINT", "").strip()  # e.g. "https://<accountid>.r2.cloudflarestorage.com"
+R2_ACCESS_KEY_ID = (
+    os.getenv("R2_ACCESS_KEY_ID", "").strip()
+    or os.getenv("R2_ACCESS_KEY", "").strip()
+)
+R2_SECRET_ACCESS_KEY = (
+    os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+    or os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+)
 
-
-# ============================================================
-# ENV CHECKS
-# ============================================================
+# ----------------------------
+# Required env check
+# ----------------------------
 def _require_env() -> None:
     missing = []
     for k in [
+        "SHOPIFY_SHOP",
         "SHOPIFY_CLIENT_ID",
         "SHOPIFY_CLIENT_SECRET",
         "SHOPIFY_WEBHOOK_SECRET",
         "SHOPIFY_API_VERSION",
-        "R2_ACCESS_KEY_ID",
-        "R2_SECRET_ACCESS_KEY",
-        "R2_ACCOUNT_ID",
         "R2_BUCKET",
         "R2_PUBLIC_BASE_URL",
+        "R2_ENDPOINT",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
     ]:
-        if not os.getenv(k):
+        if not os.getenv(k) and not (k == "R2_ACCESS_KEY_ID" and R2_ACCESS_KEY_ID):
             missing.append(k)
-
-    # SHOPIFY_SHOP is optional (we prefer header shop domain), but allow fallback
-    if not os.getenv("SHOPIFY_SHOP"):
-        # don't fail hard; we'll derive from webhook header
-        pass
-
     if missing:
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
 
-# ============================================================
-# SHOPIFY WEBHOOK SIGNATURE
-# ============================================================
+# ----------------------------
+# Shopify webhook verification
+# ----------------------------
 def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
     """
     Shopify sends X-Shopify-Hmac-Sha256 which is:
@@ -70,7 +72,6 @@ def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
     """
     if not SHOPIFY_WEBHOOK_SECRET:
         return False
-
     digest = hmac.new(
         SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
         raw_body,
@@ -80,26 +81,19 @@ def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
     return hmac.compare_digest(computed, hmac_header or "")
 
 
-# ============================================================
-# SHOPIFY AUTH: CLIENT CREDENTIALS TOKEN (CACHED)
-# ============================================================
-_token_cache_by_shop: Dict[str, Dict[str, Any]] = {}
+# ----------------------------
+# Shopify access token (client credentials) + GraphQL
+# ----------------------------
+_token_cache = {"access_token": None, "expires_at": 0}
 
 
-def get_shopify_access_token(shop: str) -> str:
-    """
-    Gets an access token via client credentials grant, cached in-memory per shop.
-    """
-    if not shop:
-        raise RuntimeError("Missing shop domain for token request")
-
+def get_shopify_access_token() -> str:
     now = int(time.time())
-    cache = _token_cache_by_shop.setdefault(shop, {"access_token": None, "expires_at": 0})
+    if _token_cache["access_token"] and now < _token_cache["expires_at"] - 60:
+        return _token_cache["access_token"]
 
-    if cache["access_token"] and now < int(cache["expires_at"]) - 60:
-        return cache["access_token"]
-
-    url = f"https://{shop}/admin/oauth/access_token"
+    # NOTE: Shopify's client credentials endpoint for admin access tokens
+    url = f"https://{SHOPIFY_SHOP}/admin/oauth/access_token"
     resp = requests.post(
         url,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -113,83 +107,56 @@ def get_shopify_access_token(shop: str) -> str:
     resp.raise_for_status()
     data = resp.json()
 
-    cache["access_token"] = data["access_token"]
-    cache["expires_at"] = now + int(data.get("expires_in", 86399))
-    return cache["access_token"]
+    _token_cache["access_token"] = data["access_token"]
+    _token_cache["expires_at"] = now + int(data.get("expires_in", 86399))
+    return _token_cache["access_token"]
 
 
-def shopify_graphql(shop: str, api_version: str, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    POST GraphQL to Shopify Admin API using the cached client-credentials token.
-    Retries once on 401 by clearing the cache.
-    """
-    token = get_shopify_access_token(shop)
-    url = f"https://{shop}/admin/api/{api_version}/graphql.json"
-    payload = {"query": query, "variables": variables or {}}
-    headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": token}
+def shopify_graphql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    token = get_shopify_access_token()
+    url = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    r = requests.post(
+        url,
+        json={"query": query, "variables": variables or {}},
+        headers={
+            "X-Shopify-Access-Token": token,
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
 
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-
+    # One refresh attempt on 401
     if r.status_code == 401:
-        # token invalid/expired; retry once
-        _token_cache_by_shop[shop]["access_token"] = None
-        token = get_shopify_access_token(shop)
-        headers["X-Shopify-Access-Token"] = token
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        _token_cache["access_token"] = None
+        token = get_shopify_access_token()
+        r = requests.post(
+            url,
+            json={"query": query, "variables": variables or {}},
+            headers={
+                "X-Shopify-Access-Token": token,
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
 
     r.raise_for_status()
     data = r.json()
-
-    if "errors" in data and data["errors"]:
+    if data.get("errors"):
         raise RuntimeError(f"Shopify GraphQL errors: {data['errors']}")
-
     return data
 
 
-# ============================================================
-# NEW: RESOLVE ORDER GID FROM NUMERIC ID
-# ============================================================
-def get_order_gid_from_numeric_id(shop: str, order_id: str) -> str:
-    """
-    Webhooks often provide only numeric order id. Metafields need ownerId (GID).
-    We query orders with 'id:{order_id}' to get the GraphQL GID.
-    """
-    query = """
-    query GetOrder($query: String!) {
-      orders(first: 1, query: $query) {
-        edges {
-          node {
-            id
-            name
-          }
-        }
-      }
-    }
-    """
-    variables = {"query": f"id:{order_id}"}
-
-    data = shopify_graphql(shop, SHOPIFY_API_VERSION, query, variables)
-    edges = data.get("data", {}).get("orders", {}).get("edges", [])
-
-    if not edges:
-        raise RuntimeError(f"Order {order_id} not found in shop {shop}")
-
-    return edges[0]["node"]["id"]
-
-
-# ============================================================
-# R2 (S3-COMPAT)
-# ============================================================
+# ----------------------------
+# R2 helpers
+# ----------------------------
 def make_r2_client():
-    if not (R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_ACCOUNT_ID):
-        raise RuntimeError("Missing R2 credentials")
-
-    endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    if not (R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY):
+        raise RuntimeError("Missing R2 credentials/endpoint")
 
     return boto3.client(
         "s3",
         region_name="auto",
-        endpoint_url=endpoint_url,
+        endpoint_url=R2_ENDPOINT,
         aws_access_key_id=R2_ACCESS_KEY_ID,
         aws_secret_access_key=R2_SECRET_ACCESS_KEY,
         config=Config(signature_version="s3v4"),
@@ -208,27 +175,65 @@ def upload_png_to_r2(png_bytes: bytes, object_key: str) -> str:
     return f"{R2_PUBLIC_BASE_URL}/{object_key}"
 
 
-# ============================================================
-# ORDER ID HELPERS
-# ============================================================
-def extract_order_id(payload: Dict[str, Any]) -> str:
-    """
-    Prefer numeric 'id' if present. Else try to parse digits from admin_graphql_api_id.
-    """
+# ----------------------------
+# Order helpers
+# ----------------------------
+def extract_numeric_order_id(payload: Dict[str, Any]) -> str:
     if "id" in payload:
         return str(payload["id"])
-
     gid = payload.get("admin_graphql_api_id", "")
-    m = re.search(r"(\d+)$", gid)
+    m = re.search(r"(\d+)$", gid or "")
     if m:
         return m.group(1)
-
     raise ValueError("Could not extract order id from webhook payload")
 
 
-# ============================================================
-# CREST PNG GENERATOR (PLACEHOLDER)
-# ============================================================
+def extract_order_gid(payload: Dict[str, Any]) -> Optional[str]:
+    gid = payload.get("admin_graphql_api_id")
+    if isinstance(gid, str) and gid.startswith("gid://shopify/Order/"):
+        return gid
+    return None
+
+
+def get_order_gid_from_numeric_id(order_id: str, max_wait_seconds: float = 12.0) -> str:
+    """
+    If the webhook payload doesn't include admin_graphql_api_id, we look it up.
+    Shopify can be briefly eventually-consistent, so we retry for a short period.
+    """
+    query = """
+    query FindOrder($q: String!) {
+      orders(first: 1, query: $q) {
+        edges {
+          node {
+            id
+            name
+          }
+        }
+      }
+    }
+    """
+    # Shopify order search supports id:12345
+    q = f"id:{order_id}"
+
+    start = time.time()
+    delay = 0.5
+
+    while True:
+        data = shopify_graphql(query, {"q": q})
+        edges = data.get("data", {}).get("orders", {}).get("edges", []) or []
+        if edges:
+            return edges[0]["node"]["id"]
+
+        if time.time() - start >= max_wait_seconds:
+            raise RuntimeError(f"Order {order_id} not found in shop {SHOPIFY_SHOP}")
+
+        time.sleep(delay)
+        delay = min(delay * 1.6, 3.0)
+
+
+# ----------------------------
+# Crest generator (placeholder)
+# ----------------------------
 def generate_crest_png(order_id: str) -> bytes:
     size = 1024
     img = Image.new("RGBA", (size, size), (0, 0, 0, 255))
@@ -259,10 +264,10 @@ def generate_crest_png(order_id: str) -> bytes:
     return buf.getvalue()
 
 
-# ============================================================
-# WRITE METAFIELD
-# ============================================================
-def write_order_metafield(shop: str, order_gid: str, crest_url: str) -> None:
+# ----------------------------
+# Metafield writeback
+# ----------------------------
+def write_order_metafield(order_gid: str, crest_url: str) -> None:
     mutation = """
     mutation SetCrestUrl($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) {
@@ -283,18 +288,18 @@ def write_order_metafield(shop: str, order_gid: str, crest_url: str) -> None:
         ]
     }
 
-    data = shopify_graphql(shop, SHOPIFY_API_VERSION, mutation, variables)
-    errs = data.get("data", {}).get("metafieldsSet", {}).get("userErrors", [])
+    data = shopify_graphql(mutation, variables)
+    errs = data.get("data", {}).get("metafieldsSet", {}).get("userErrors", []) or []
     if errs:
         raise RuntimeError(f"metafieldsSet userErrors: {errs}")
 
 
-# ============================================================
-# ROUTES
-# ============================================================
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/")
 def home():
-    return jsonify({"ok": True, "service": "cult-generator", "version": "v2-r2-metafield-gid-resolve"})
+    return jsonify({"ok": True, "service": "cult-generator", "version": "v3-locked-shop-retry"})
 
 
 @app.get("/health")
@@ -308,6 +313,16 @@ def health():
 
 @app.post("/webhook/order-paid")
 def webhook_order_paid():
+    # 0) hard lock to your store
+    shop_from_header = (request.headers.get("X-Shopify-Shop-Domain") or "").strip()
+    # Shopify sometimes uses different header names; keep a fallback:
+    if not shop_from_header:
+        shop_from_header = (request.headers.get("X-Shopify-Shop-Domain".lower()) or "").strip()
+
+    if shop_from_header and shop_from_header != SHOPIFY_SHOP:
+        # Wrong shop => refuse. This is what stops your dev-store from hitting production.
+        abort(401, f"Webhook shop mismatch: {shop_from_header}")
+
     raw = request.get_data(cache=False, as_text=False)
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
 
@@ -319,15 +334,12 @@ def webhook_order_paid():
     except Exception:
         abort(400, "Invalid JSON")
 
-    # Prefer shop domain from webhook header; fallback to env
-    shop = (request.headers.get("X-Shopify-Shop-Domain", "") or SHOPIFY_SHOP).strip()
-    if not shop:
-        abort(400, "Missing X-Shopify-Shop-Domain and SHOPIFY_SHOP env var")
+    order_id = extract_numeric_order_id(payload)
+    order_gid = extract_order_gid(payload)
 
-    order_id = extract_order_id(payload)
-
-    print("Webhook from shop:", shop)
-    print("Numeric order id:", order_id)
+    # If gid not provided, look it up (with retry)
+    if not order_gid:
+        order_gid = get_order_gid_from_numeric_id(order_id)
 
     # 1) Generate PNG
     png_bytes = generate_crest_png(order_id)
@@ -336,16 +348,13 @@ def webhook_order_paid():
     object_key = f"crest_{order_id}.png"
     crest_url = upload_png_to_r2(png_bytes, object_key)
 
-    # 3) Resolve real Order GID, then write metafield
-    order_gid = get_order_gid_from_numeric_id(shop, order_id)
-    print("Resolved order GID:", order_gid)
+    # 3) Write URL back to Shopify order (metafield)
+    write_order_metafield(order_gid, crest_url)
 
-    write_order_metafield(shop, order_gid, crest_url)
-
-    print(f"SUCCESS: crest written to order {order_id}")
+    print(f"Order paid received: {order_id}")
     print(f"Uploaded to R2: {crest_url}")
 
-    return jsonify({"ok": True, "shop": shop, "order_id": order_id, "order_gid": order_gid, "crest_url": crest_url})
+    return jsonify({"ok": True, "order_id": order_id, "crest_url": crest_url})
 
 
 @app.get("/crest/<order_id>.png")
