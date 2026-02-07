@@ -1,138 +1,302 @@
-import os
-import hmac
 import base64
 import hashlib
-import random
-from datetime import datetime
+import hmac
+import io
+import json
+import os
+import re
+from typing import Any, Dict, Optional
 
-from flask import Flask, request, jsonify, send_from_directory, abort
-from PIL import Image, ImageOps
+import boto3
+import requests
+from botocore.config import Config
+from flask import Flask, abort, jsonify, redirect, request
+from PIL import Image, ImageDraw
 
 app = Flask(__name__)
 
-# ============================================================
-# ENV VARS (from Render)
-# ============================================================
-SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET")
+# ----------------------------
+# Env vars (Render)
+# ----------------------------
+SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN", "").strip()
+SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "").strip()  # e.g. "cultofcustoms.co.uk" (no https)
+SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-01").strip()
 
-# ============================================================
-# Paths
-# ============================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
+R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
+R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")  # e.g. "https://pub-xxxx.r2.dev"
 
-ASSETS_DIR = os.path.join(BASE_DIR, "assets")
-SHIELD_DIR = os.path.join(ASSETS_DIR, "shields")
-SIGIL_DIR = os.path.join(ASSETS_DIR, "sigils")
 
-STATIC_DIR = os.path.join(BASE_DIR, "static")
-GENERATED_DIR = os.path.join(STATIC_DIR, "generated")
+# ----------------------------
+# Helpers
+# ----------------------------
+def _require_env() -> None:
+    missing = []
+    for k in [
+        "SHOPIFY_ADMIN_TOKEN",
+        "SHOPIFY_STORE_DOMAIN",
+        "SHOPIFY_WEBHOOK_SECRET",
+        "SHOPIFY_API_VERSION",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_ACCOUNT_ID",
+        "R2_BUCKET",
+        "R2_PUBLIC_BASE_URL",
+    ]:
+        if not os.getenv(k):
+            missing.append(k)
+    if missing:
+        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
-os.makedirs(GENERATED_DIR, exist_ok=True)
 
-ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
-
-# ============================================================
-# Shopify Webhook Verification
-# ============================================================
-def verify_shopify_webhook(data, hmac_header):
+def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
+    """
+    Shopify sends X-Shopify-Hmac-Sha256 which is:
+    base64( HMAC_SHA256(secret, raw_body) )
+    """
+    if not SHOPIFY_WEBHOOK_SECRET:
+        return False
     digest = hmac.new(
         SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
-        data,
-        hashlib.sha256
+        raw_body,
+        hashlib.sha256,
     ).digest()
+    computed = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(computed, hmac_header or "")
 
-    computed_hmac = base64.b64encode(digest)
 
-    return hmac.compare_digest(computed_hmac, hmac_header.encode("utf-8"))
+def shopify_graphql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not SHOPIFY_ADMIN_TOKEN or not SHOPIFY_STORE_DOMAIN:
+        raise RuntimeError("Missing SHOPIFY_ADMIN_TOKEN or SHOPIFY_STORE_DOMAIN")
 
-# ============================================================
-# Image Helpers
-# ============================================================
-def list_image_files(folder_path):
-    return [f for f in os.listdir(folder_path)
-            if os.path.splitext(f.lower())[1] in ALLOWED_EXTS]
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+    }
+    payload = {"query": query, "variables": variables or {}}
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    # Shopify GraphQL may include top-level errors
+    if "errors" in data and data["errors"]:
+        raise RuntimeError(f"Shopify GraphQL errors: {data['errors']}")
+    return data
 
-def open_rgba(path):
-    return Image.open(path).convert("RGBA")
 
-# ============================================================
-# Crest Generator
-# ============================================================
-def generate_crest(order_id):
-    shields = list_image_files(SHIELD_DIR)
-    sigils = list_image_files(SIGIL_DIR)
+def make_r2_client():
+    """
+    Cloudflare R2 is S3-compatible.
+    Endpoint is: https://<accountid>.r2.cloudflarestorage.com
+    Region can be "auto".
+    """
+    if not (R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_ACCOUNT_ID):
+        raise RuntimeError("Missing R2 credentials")
 
-    shield = open_rgba(os.path.join(SHIELD_DIR, random.choice(shields)))
-    sigil = open_rgba(os.path.join(SIGIL_DIR, random.choice(sigils)))
+    endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-    if random.random() < 0.5:
-        sigil = ImageOps.mirror(sigil)
+    return boto3.client(
+        "s3",
+        region_name="auto",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+    )
 
-    palette = [
-        (0,0,0,255),(255,255,0,255),(70,170,255,255),
-        (40,70,160,255),(245,90,40,255),(120,120,120,255),(255,255,255,255)
+
+def upload_png_to_r2(png_bytes: bytes, object_key: str) -> str:
+    """
+    Upload to R2 bucket and return public URL based on R2_PUBLIC_BASE_URL.
+    Requires bucket to have Public Development URL enabled (which you did).
+    """
+    s3 = make_r2_client()
+
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=object_key,
+        Body=png_bytes,
+        ContentType="image/png",
+        CacheControl="public, max-age=31536000, immutable",
+    )
+
+    return f"{R2_PUBLIC_BASE_URL}/{object_key}"
+
+
+def extract_order_id(payload: Dict[str, Any]) -> str:
+    """
+    Your logs show an integer order ID (e.g. 820982911946154508).
+    Shopify webhooks also include 'id' and 'admin_graphql_api_id'.
+    We'll prefer 'id' for filename and 'admin_graphql_api_id' for GraphQL updates.
+    """
+    # Prefer numeric id if present
+    if "id" in payload:
+        return str(payload["id"])
+
+    # fallback: pull digits from admin_graphql_api_id
+    gid = payload.get("admin_graphql_api_id", "")
+    m = re.search(r"(\d+)$", gid)
+    if m:
+        return m.group(1)
+
+    raise ValueError("Could not extract order id from webhook payload")
+
+
+def extract_order_gid(payload: Dict[str, Any]) -> Optional[str]:
+    gid = payload.get("admin_graphql_api_id")
+    if isinstance(gid, str) and gid.startswith("gid://shopify/Order/"):
+        return gid
+    return None
+
+
+def generate_crest_png(order_id: str) -> bytes:
+    """
+    Replace this with your real crest generator.
+    For now: black canvas with a simple shield mark (placeholder).
+    Output: PNG bytes.
+    """
+    size = 1024
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Simple shield placeholder
+    cx, cy = size // 2, size // 2
+    w, h = 220, 260
+    shield = [
+        (cx - w, cy - h),
+        (cx + w, cy - h),
+        (cx + w, cy - 20),
+        (cx, cy + h),
+        (cx - w, cy - 20),
     ]
+    draw.polygon(shield, outline=(255, 255, 255, 255), width=12)
 
-    sigil_colour = random.choice(palette)
-    bg_colour = random.choice([c for c in palette if c != sigil_colour])
+    # Yellow "crest" shape inside
+    inner = [
+        (cx - 70, cy - 40),
+        (cx + 70, cy - 40),
+        (cx + 40, cy + 10),
+        (cx, cy + 90),
+        (cx - 40, cy + 10),
+    ]
+    draw.polygon(inner, fill=(255, 215, 0, 255))
 
-    alpha = sigil.split()[-1]
-    coloured_sigil = Image.new("RGBA", sigil.size, sigil_colour)
-    coloured_sigil.putalpha(alpha)
+    # Optional: tiny id marker (comment out if you don't want it)
+    # draw.text((20, size - 60), f"order {order_id}", fill=(255, 255, 255, 120))
 
-    background = Image.new("RGBA", shield.size, bg_colour)
-    canvas = Image.alpha_composite(background, shield)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
-    coloured_sigil.thumbnail((int(shield.size[0]*0.6), int(shield.size[1]*0.6)))
-    x = (canvas.size[0]-coloured_sigil.size[0])//2
-    y = (canvas.size[1]-coloured_sigil.size[1])//2
 
-    canvas.paste(coloured_sigil,(x,y),coloured_sigil)
+def write_order_metafield(order_gid: str, crest_url: str) -> None:
+    """
+    Writes: namespace 'cult', key 'crest_url'
+    Type: single_line_text_field
+    """
+    mutation = """
+    mutation SetCrestUrl($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields {
+          id
+          namespace
+          key
+          value
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    variables = {
+        "metafields": [
+            {
+                "ownerId": order_gid,
+                "namespace": "cult",
+                "key": "crest_url",
+                "type": "single_line_text_field",
+                "value": crest_url,
+            }
+        ]
+    }
 
-    filename = f"crest_{order_id}.png"
-    path = os.path.join(GENERATED_DIR, filename)
-    canvas.save(path)
+    data = shopify_graphql(mutation, variables)
+    errs = data.get("data", {}).get("metafieldsSet", {}).get("userErrors", [])
+    if errs:
+        raise RuntimeError(f"metafieldsSet userErrors: {errs}")
 
-    return filename
 
-# ============================================================
-# SHOPIFY WEBHOOK ROUTE (THE IMPORTANT BIT)
-# ============================================================
-@app.post("/webhook/order-paid")
-def order_paid():
-
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256")
-    data = request.get_data()
-
-    if not verify_shopify_webhook(data, hmac_header):
-        abort(401)
-
-    order = request.json
-    order_id = order["id"]
-
-    print("Order paid received:", order_id)
-
-    filename = generate_crest(order_id)
-
-    print("Generated:", filename)
-
-    return jsonify({"status": "success"}), 200
-
-# ============================================================
-# FILE SERVING
-# ============================================================
-@app.get("/preview/<filename>")
-def preview(filename):
-    return send_from_directory(GENERATED_DIR, filename)
-
-@app.get("/download/<filename>")
-def download(filename):
-    return send_from_directory(GENERATED_DIR, filename, as_attachment=True)
-
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/")
 def home():
-    return "Cult Generator running"
+    return jsonify(
+        {
+            "ok": True,
+            "service": "cult-generator",
+            "version": "v2-r2-metafield",
+        }
+    )
 
-# ============================================================
+
+@app.get("/health")
+def health():
+    # basic sanity check without leaking secrets
+    try:
+        _require_env()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/webhook/order-paid")
+def webhook_order_paid():
+    raw = request.get_data(cache=False, as_text=False)
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+
+    if not verify_shopify_webhook(raw, hmac_header):
+        abort(401, "Invalid webhook signature")
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        abort(400, "Invalid JSON")
+
+    order_id = extract_order_id(payload)
+    order_gid = extract_order_gid(payload)
+
+    # 1) Generate PNG
+    png_bytes = generate_crest_png(order_id)
+
+    # 2) Upload to R2
+    object_key = f"crest_{order_id}.png"
+    crest_url = upload_png_to_r2(png_bytes, object_key)
+
+    # 3) Write URL back to Shopify order (metafield)
+    if order_gid:
+        write_order_metafield(order_gid, crest_url)
+
+    print(f"Order paid received: {order_id}")
+    print(f"Uploaded to R2: {crest_url}")
+
+    return jsonify({"ok": True, "order_id": order_id, "crest_url": crest_url})
+
+
+@app.get("/crest/<order_id>.png")
+def crest_redirect(order_id: str):
+    """
+    Convenience: redirect to the public R2 URL for this order's crest.
+    """
+    url = f"{R2_PUBLIC_BASE_URL}/crest_{order_id}.png"
+    return redirect(url, code=302)
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
+    # Local dev only
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
