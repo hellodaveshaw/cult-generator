@@ -319,9 +319,8 @@ def webhook_order_paid():
     if not shop_from_header:
         shop_from_header = (request.headers.get("X-Shopify-Shop-Domain".lower()) or "").strip()
 
-    if shop_from_header and shop_from_header != SHOPIFY_SHOP:
-        # Wrong shop => refuse. This is what stops your dev-store from hitting production.
-        abort(401, f"Webhook shop mismatch: {shop_from_header}")
+# TEMP: don't hard-fail on shop domain header
+# we'll rely on HMAC validation instead
 
     raw = request.get_data(cache=False, as_text=False)
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
