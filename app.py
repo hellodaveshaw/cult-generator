@@ -33,10 +33,10 @@ log = logging.getLogger("cult-generator")
 # Shopify webhook verification (HMAC header verification)
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
 
-# Shop domain (recommended to set)
+# Shop domain (recommended to set, used for /install auth URL and Admin API host)
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()  # e.g. cultofcustoms.myshopify.com
 
-# Optional strict shop lock
+# Optional strict shop lock (webhooks only)
 STRICT_SHOP_LOCK = os.getenv("STRICT_SHOP_LOCK", "0").strip() == "1"
 
 # OAuth (used once to mint an Admin API access token)
@@ -87,7 +87,7 @@ def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
 
 def maybe_enforce_shop_lock():
     """
-    Optional hard lock to a single shop domain.
+    Optional hard lock to a single shop domain (webhooks only).
     Only applied after verifying webhook HMAC.
     """
     if not (STRICT_SHOP_LOCK and SHOPIFY_SHOP):
@@ -273,6 +273,8 @@ def shopify_auth_callback():
     """
     Step 2: Shopify redirects here with code + hmac + state.
     We verify state and HMAC, then exchange code for access token and store in R2.
+
+    NOTE: Option A applied — we do NOT enforce shop matching here.
     """
     code = request.args.get("code", "")
     shop = request.args.get("shop", "")
@@ -281,17 +283,17 @@ def shopify_auth_callback():
     if not code or not shop or not state:
         abort(400, "Missing code/shop/state")
 
-    if SHOPIFY_SHOP and shop != SHOPIFY_SHOP:
-        abort(401, "Shop mismatch")
-
+    # CSRF: verify state against cookie
     expected_state = request.cookies.get("shopify_oauth_state", "")
     if not expected_state or not hmac.compare_digest(expected_state, state):
         abort(401, "Invalid OAuth state")
 
+    # Verify Shopify HMAC over query params
     qp = dict(request.args)
     if not _shopify_oauth_hmac_is_valid(qp):
         abort(401, "Invalid OAuth HMAC")
 
+    # Exchange code for access token
     token_url = f"https://{shop}/admin/oauth/access_token"
     payload = {
         "client_id": SHOPIFY_API_KEY,
@@ -465,12 +467,10 @@ def webhook_order_paid():
 
     order_id = payload.get("id") or payload.get("order_id")
     if not order_id:
-        # Still return 200 so Shopify doesn't retry forever; log the event.
         log.warning("Webhook received but no order id found in payload")
         return jsonify({"ok": True, "note": "No order id in payload"}), 200
 
     try:
-        # Generate crest
         png_bytes = generate_crest_png_bytes()
 
         # Stable object key per order (retries overwrite same file)
@@ -484,7 +484,6 @@ def webhook_order_paid():
         return jsonify({"ok": True, "order_id": order_id, "crest_url": crest_url}), 200
 
     except Exception as e:
-        # Return 200 to avoid retry storms; log details for debugging.
         log.exception("Webhook processing failed for order %s: %s", str(order_id), str(e))
         return jsonify({"ok": True, "note": "Webhook verified; processing failed (logged)"}), 200
 
