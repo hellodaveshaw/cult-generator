@@ -7,7 +7,9 @@ import hashlib
 import logging
 import io
 import random
+import secrets
 from pathlib import Path
+from urllib.parse import urlencode
 
 from flask import Flask, request, abort, jsonify
 import boto3
@@ -28,16 +30,29 @@ log = logging.getLogger("cult-generator")
 # Environment variables
 # =========================================================
 
-# Shopify webhook verification
-SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
-SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()
+# Shopify webhook verification (HMAC header verification)
+SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
 
-# Shopify Admin API (for writing download link to order)
-SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN", "").strip()
-SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-07").strip()
+# Shop domain (recommended to set)
+SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()  # e.g. cultofcustoms.myshopify.com
 
 # Optional strict shop lock
 STRICT_SHOP_LOCK = os.getenv("STRICT_SHOP_LOCK", "0").strip() == "1"
+
+# OAuth (used once to mint an Admin API access token)
+SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY", "").strip()          # Client ID
+SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET", "").strip()    # Secret (often starts shpss_)
+SHOPIFY_SCOPES = os.getenv("SHOPIFY_SCOPES", "read_orders,write_orders").strip()
+SHOPIFY_REDIRECT_URI = os.getenv("SHOPIFY_REDIRECT_URI", "").strip()  # e.g. https://<service>/auth/callback
+
+# Shopify API version used for Admin API calls
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-07").strip()
+
+# Where we store OAuth access token (in R2)
+SHOPIFY_TOKEN_R2_KEY = os.getenv(
+    "SHOPIFY_TOKEN_R2_KEY",
+    "secrets/shopify_admin_token.json"
+).strip()
 
 # Cloudflare R2 (S3 compatible)
 R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").strip()
@@ -45,7 +60,7 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
 
-# Public base URL for downloads
+# Public base URL for downloads (recommended)
 R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip()
 
 
@@ -53,6 +68,10 @@ R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip()
 # Shopify webhook verification
 # =========================================================
 def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
+    """
+    Shopify sends X-Shopify-Hmac-Sha256 which is:
+    base64( HMAC_SHA256(secret, raw_body) )
+    """
     if not SHOPIFY_WEBHOOK_SECRET:
         return False
 
@@ -67,6 +86,10 @@ def verify_shopify_webhook(raw_body: bytes, hmac_header: str) -> bool:
 
 
 def maybe_enforce_shop_lock():
+    """
+    Optional hard lock to a single shop domain.
+    Only applied after verifying webhook HMAC.
+    """
     if not (STRICT_SHOP_LOCK and SHOPIFY_SHOP):
         return
 
@@ -96,6 +119,9 @@ def make_r2_client():
     if missing:
         raise RuntimeError(f"Missing R2 env vars: {', '.join(missing)}")
 
+    if "<" in R2_ENDPOINT_URL or ">" in R2_ENDPOINT_URL:
+        raise RuntimeError(f"R2_ENDPOINT_URL contains placeholders: {R2_ENDPOINT_URL}")
+
     _r2_client = boto3.client(
         "s3",
         endpoint_url=R2_ENDPOINT_URL,
@@ -115,7 +141,7 @@ def upload_png_to_r2(png_bytes: bytes, object_key: str) -> str:
         Key=object_key,
         Body=png_bytes,
         ContentType="image/png",
-        ACL="public-read",
+        ACL="public-read",  # remove if you prefer private bucket + signed URLs later
         CacheControl="public, max-age=31536000, immutable",
     )
 
@@ -134,6 +160,10 @@ def r2_object_exists(object_key: str) -> bool:
 
 
 def mark_unique_hash_used(hash_hex: str) -> bool:
+    """
+    Hard guarantee never-repeat: reserve a marker object for the final PNG hash.
+    Returns True if reserved now, False if already exists.
+    """
     key = f"unique/{hash_hex}.txt"
     if r2_object_exists(key):
         return False
@@ -144,15 +174,166 @@ def mark_unique_hash_used(hash_hex: str) -> bool:
 
 
 # =========================================================
-# Shopify Admin API helper
+# OAuth helpers: obtain & persist Admin API access token
+# =========================================================
+def _shopify_oauth_hmac_is_valid(query_params: dict) -> bool:
+    """
+    Verify Shopify OAuth callback query params using HMAC-SHA256 (hex digest).
+    Shopify signs all query params except 'hmac' itself.
+    """
+    if not SHOPIFY_API_SECRET:
+        return False
+
+    received_hmac = query_params.get("hmac", "")
+    if not received_hmac:
+        return False
+
+    items = []
+    for k in sorted(query_params.keys()):
+        if k in ("hmac", "signature"):
+            continue
+        v = query_params.get(k)
+        items.append(f"{k}={v}")
+    message = "&".join(items)
+
+    digest = hmac.new(
+        SHOPIFY_API_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(digest, received_hmac)
+
+
+def _save_shopify_token_to_r2(token_payload: dict) -> None:
+    s3 = make_r2_client()
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=SHOPIFY_TOKEN_R2_KEY,
+        Body=json.dumps(token_payload).encode("utf-8"),
+        ContentType="application/json",
+        CacheControl="no-store",
+    )
+
+
+def load_shopify_admin_token() -> str:
+    """
+    Prefer explicit env var if present, otherwise load from R2.
+    """
+    tok = os.getenv("SHOPIFY_ADMIN_TOKEN", "").strip()
+    if tok:
+        return tok
+
+    s3 = make_r2_client()
+    try:
+        obj = s3.get_object(Bucket=R2_BUCKET, Key=SHOPIFY_TOKEN_R2_KEY)
+        data = obj["Body"].read().decode("utf-8")
+        payload = json.loads(data)
+        return (payload.get("access_token") or "").strip()
+    except Exception:
+        return ""
+
+
+# =========================================================
+# OAuth routes (run once)
+# =========================================================
+@app.get("/install")
+def shopify_install():
+    """
+    Step 1: returns a URL you paste into your browser to approve the app.
+    """
+    if not (SHOPIFY_API_KEY and SHOPIFY_REDIRECT_URI and SHOPIFY_SHOP):
+        abort(500, "Missing SHOPIFY_API_KEY / SHOPIFY_REDIRECT_URI / SHOPIFY_SHOP")
+
+    state = secrets.token_urlsafe(24)
+
+    params = {
+        "client_id": SHOPIFY_API_KEY,
+        "scope": SHOPIFY_SCOPES,
+        "redirect_uri": SHOPIFY_REDIRECT_URI,
+        "state": state,
+    }
+
+    auth_url = f"https://{SHOPIFY_SHOP}/admin/oauth/authorize?{urlencode(params)}"
+
+    resp = jsonify({"ok": True, "redirect_to": auth_url})
+    resp.set_cookie(
+        "shopify_oauth_state",
+        state,
+        max_age=600,
+        secure=True,
+        httponly=True,
+        samesite="Lax",
+    )
+    return resp, 200
+
+
+@app.get("/auth/callback")
+def shopify_auth_callback():
+    """
+    Step 2: Shopify redirects here with code + hmac + state.
+    We verify state and HMAC, then exchange code for access token and store in R2.
+    """
+    code = request.args.get("code", "")
+    shop = request.args.get("shop", "")
+    state = request.args.get("state", "")
+
+    if not code or not shop or not state:
+        abort(400, "Missing code/shop/state")
+
+    if SHOPIFY_SHOP and shop != SHOPIFY_SHOP:
+        abort(401, "Shop mismatch")
+
+    expected_state = request.cookies.get("shopify_oauth_state", "")
+    if not expected_state or not hmac.compare_digest(expected_state, state):
+        abort(401, "Invalid OAuth state")
+
+    qp = dict(request.args)
+    if not _shopify_oauth_hmac_is_valid(qp):
+        abort(401, "Invalid OAuth HMAC")
+
+    token_url = f"https://{shop}/admin/oauth/access_token"
+    payload = {
+        "client_id": SHOPIFY_API_KEY,
+        "client_secret": SHOPIFY_API_SECRET,
+        "code": code,
+    }
+
+    r = requests.post(token_url, json=payload, timeout=15)
+    if r.status_code >= 300:
+        abort(500, f"Token exchange failed: {r.status_code} {r.text}")
+
+    token_payload = r.json()
+    access_token = (token_payload.get("access_token") or "").strip()
+    if not access_token:
+        abort(500, "No access_token returned")
+
+    _save_shopify_token_to_r2({
+        "shop": shop,
+        "access_token": access_token,
+        "scopes": SHOPIFY_SCOPES,
+        "saved_at": int(time.time()),
+    })
+
+    resp = jsonify({"ok": True, "message": "OAuth complete. Token saved to R2.", "shop": shop})
+    resp.set_cookie("shopify_oauth_state", "", expires=0)
+    return resp, 200
+
+
+# =========================================================
+# Shopify Admin API helper (writes crest URL to order)
 # =========================================================
 def add_crest_url_to_order(order_id: str, crest_url: str) -> None:
-    if not (SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN):
-        raise RuntimeError("Missing Shopify Admin API configuration")
+    token = load_shopify_admin_token()
+    if not token:
+        raise RuntimeError("No Shopify Admin token available. Run /install then approve OAuth first.")
+
+    if not SHOPIFY_SHOP:
+        raise RuntimeError("Missing SHOPIFY_SHOP")
 
     url = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/orders/{order_id}.json"
     headers = {
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+        "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
     }
 
@@ -185,6 +366,9 @@ _SIGIL_FILES = sorted(p for p in SIGILS_DIR.glob("*.png") if p.is_file())
 # Image helpers (alpha tinting)
 # =========================================================
 def tint_from_alpha(img: Image.Image, rgb: tuple[int, int, int]) -> Image.Image:
+    """
+    For monochrome-on-transparent assets: use alpha as mask and fill with rgb.
+    """
     img = img.convert("RGBA")
     _, _, _, a = img.split()
     coloured = Image.new("RGBA", img.size, rgb + (255,))
@@ -193,6 +377,9 @@ def tint_from_alpha(img: Image.Image, rgb: tuple[int, int, int]) -> Image.Image:
 
 
 def composite_sigil_on_shield(shield: Image.Image, sigil: Image.Image, rng: random.Random) -> Image.Image:
+    """
+    Conservative one-off variation: slight rotation/scale/offset + occasional mirror.
+    """
     if rng.random() < 0.20:
         sigil = ImageOps.mirror(sigil)
 
@@ -218,11 +405,17 @@ def composite_sigil_on_shield(shield: Image.Image, sigil: Image.Image, rng: rand
 # Crest generator (guaranteed unique)
 # =========================================================
 def generate_crest_png_bytes() -> bytes:
+    if not _SHIELD_FILES:
+        raise RuntimeError("No shield PNGs found in assets/shields")
+    if not _SIGIL_FILES:
+        raise RuntimeError("No sigil PNGs found in assets/sigils")
+
     rng = random.Random()
 
+    # Two colourways only
     palettes = [
-        {"shield": (205, 170, 80), "sigil": (15, 15, 15)},
-        {"shield": (30, 30, 30), "sigil": (235, 235, 235)},
+        {"shield": (205, 170, 80), "sigil": (15, 15, 15)},     # gold + near-black
+        {"shield": (30, 30, 30), "sigil": (235, 235, 235)},    # charcoal + off-white
     ]
 
     for _ in range(40):
@@ -244,7 +437,7 @@ def generate_crest_png_bytes() -> bytes:
         if mark_unique_hash_used(hash_hex):
             return png_bytes
 
-    raise RuntimeError("Unable to generate unique crest")
+    raise RuntimeError("Unable to generate unique crest after multiple attempts")
 
 
 # =========================================================
@@ -265,22 +458,35 @@ def webhook_order_paid():
 
     maybe_enforce_shop_lock()
 
-    payload = json.loads(raw.decode("utf-8"))
-    order_id = payload.get("id")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        abort(400, "Invalid JSON")
+
+    order_id = payload.get("id") or payload.get("order_id")
+    if not order_id:
+        # Still return 200 so Shopify doesn't retry forever; log the event.
+        log.warning("Webhook received but no order id found in payload")
+        return jsonify({"ok": True, "note": "No order id in payload"}), 200
 
     try:
+        # Generate crest
         png_bytes = generate_crest_png_bytes()
+
+        # Stable object key per order (retries overwrite same file)
         object_key = f"crests/order_{order_id}.png"
         crest_url = upload_png_to_r2(png_bytes, object_key)
 
+        # Write download link to order (for email template)
         add_crest_url_to_order(str(order_id), crest_url)
 
-        log.info("Crest generated for order %s", order_id)
-        return jsonify({"ok": True}), 200
+        log.info("Crest generated and attached to order %s", order_id)
+        return jsonify({"ok": True, "order_id": order_id, "crest_url": crest_url}), 200
 
     except Exception as e:
-        log.exception("Processing failed: %s", str(e))
-        return jsonify({"ok": True, "error": "Logged"}), 200
+        # Return 200 to avoid retry storms; log details for debugging.
+        log.exception("Webhook processing failed for order %s: %s", str(order_id), str(e))
+        return jsonify({"ok": True, "note": "Webhook verified; processing failed (logged)"}), 200
 
 
 # =========================================================
