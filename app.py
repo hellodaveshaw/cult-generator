@@ -33,7 +33,7 @@ log = logging.getLogger("cult-generator")
 # Shopify webhook verification (HMAC header verification)
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
 
-# Shop domain (recommended to set, used for /install auth URL and Admin API host)
+# Shop domain (used for /install auth URL and Admin API host)
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()  # e.g. cultofcustoms.myshopify.com
 
 # Optional strict shop lock (webhooks only)
@@ -41,7 +41,7 @@ STRICT_SHOP_LOCK = os.getenv("STRICT_SHOP_LOCK", "0").strip() == "1"
 
 # OAuth (used once to mint an Admin API access token)
 SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY", "").strip()          # Client ID
-SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET", "").strip()    # Secret (often starts shpss_)
+SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET", "").strip()    # Client Secret (often starts shpss_)
 SHOPIFY_SCOPES = os.getenv("SHOPIFY_SCOPES", "read_orders,write_orders").strip()
 SHOPIFY_REDIRECT_URI = os.getenv("SHOPIFY_REDIRECT_URI", "").strip()  # e.g. https://<service>/auth/callback
 
@@ -60,7 +60,7 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
 
-# Public base URL for downloads (recommended)
+# Public base URL for downloads
 R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip()
 
 
@@ -141,7 +141,7 @@ def upload_png_to_r2(png_bytes: bytes, object_key: str) -> str:
         Key=object_key,
         Body=png_bytes,
         ContentType="image/png",
-        ACL="public-read",  # remove if you prefer private bucket + signed URLs later
+        ACL="public-read",
         CacheControl="public, max-age=31536000, immutable",
     )
 
@@ -160,10 +160,6 @@ def r2_object_exists(object_key: str) -> bool:
 
 
 def mark_unique_hash_used(hash_hex: str) -> bool:
-    """
-    Hard guarantee never-repeat: reserve a marker object for the final PNG hash.
-    Returns True if reserved now, False if already exists.
-    """
     key = f"unique/{hash_hex}.txt"
     if r2_object_exists(key):
         return False
@@ -174,27 +170,50 @@ def mark_unique_hash_used(hash_hex: str) -> bool:
 
 
 # =========================================================
-# OAuth helpers: obtain & persist Admin API access token
+# OAuth helpers (robust raw-query HMAC verification)
 # =========================================================
-def _shopify_oauth_hmac_is_valid(query_params: dict) -> bool:
+def _shopify_oauth_hmac_is_valid_raw(query_string: bytes) -> bool:
     """
-    Verify Shopify OAuth callback query params using HMAC-SHA256 (hex digest).
-    Shopify signs all query params except 'hmac' itself.
+    Verify Shopify OAuth callback HMAC using the RAW query string to avoid
+    any decoding/normalisation differences (e.g. '+' vs '%20').
+
+    Algorithm:
+      - Take query string as sent by Shopify
+      - Remove 'hmac' and 'signature' parameters
+      - Sort remaining parameters by key (lexicographically)
+      - Join as 'key=value' pairs with '&'
+      - Compare hex HMAC-SHA256(secret, message) to received hmac
     """
     if not SHOPIFY_API_SECRET:
         return False
 
-    received_hmac = query_params.get("hmac", "")
+    qs = query_string.decode("utf-8", errors="strict")
+    if not qs:
+        return False
+
+    parts = qs.split("&")
+    received_hmac = None
+    kv_pairs = []
+
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+        else:
+            k, v = part, ""
+
+        if k == "hmac":
+            received_hmac = v
+            continue
+        if k in ("signature",):
+            continue
+
+        kv_pairs.append((k, v))
+
     if not received_hmac:
         return False
 
-    items = []
-    for k in sorted(query_params.keys()):
-        if k in ("hmac", "signature"):
-            continue
-        v = query_params.get(k)
-        items.append(f"{k}={v}")
-    message = "&".join(items)
+    kv_pairs.sort(key=lambda x: x[0])
+    message = "&".join([f"{k}={v}" for k, v in kv_pairs])
 
     digest = hmac.new(
         SHOPIFY_API_SECRET.encode("utf-8"),
@@ -217,9 +236,6 @@ def _save_shopify_token_to_r2(token_payload: dict) -> None:
 
 
 def load_shopify_admin_token() -> str:
-    """
-    Prefer explicit env var if present, otherwise load from R2.
-    """
     tok = os.getenv("SHOPIFY_ADMIN_TOKEN", "").strip()
     if tok:
         return tok
@@ -239,9 +255,6 @@ def load_shopify_admin_token() -> str:
 # =========================================================
 @app.get("/install")
 def shopify_install():
-    """
-    Step 1: returns a URL you paste into your browser to approve the app.
-    """
     if not (SHOPIFY_API_KEY and SHOPIFY_REDIRECT_URI and SHOPIFY_SHOP):
         abort(500, "Missing SHOPIFY_API_KEY / SHOPIFY_REDIRECT_URI / SHOPIFY_SHOP")
 
@@ -271,10 +284,8 @@ def shopify_install():
 @app.get("/auth/callback")
 def shopify_auth_callback():
     """
-    Step 2: Shopify redirects here with code + hmac + state.
-    We verify state and HMAC, then exchange code for access token and store in R2.
-
-    NOTE: Option A applied — we do NOT enforce shop matching here.
+    OPTION A: no shop-match enforcement.
+    We still enforce: state cookie + raw-query HMAC.
     """
     code = request.args.get("code", "")
     shop = request.args.get("shop", "")
@@ -283,17 +294,14 @@ def shopify_auth_callback():
     if not code or not shop or not state:
         abort(400, "Missing code/shop/state")
 
-    # CSRF: verify state against cookie
     expected_state = request.cookies.get("shopify_oauth_state", "")
     if not expected_state or not hmac.compare_digest(expected_state, state):
         abort(401, "Invalid OAuth state")
 
-    # Verify Shopify HMAC over query params
-    qp = dict(request.args)
-    if not _shopify_oauth_hmac_is_valid(qp):
+    # RAW query-string verification (fixes your current error)
+    if not _shopify_oauth_hmac_is_valid_raw(request.query_string):
         abort(401, "Invalid OAuth HMAC")
 
-    # Exchange code for access token
     token_url = f"https://{shop}/admin/oauth/access_token"
     payload = {
         "client_id": SHOPIFY_API_KEY,
@@ -323,7 +331,7 @@ def shopify_auth_callback():
 
 
 # =========================================================
-# Shopify Admin API helper (writes crest URL to order)
+# Shopify Admin API helper
 # =========================================================
 def add_crest_url_to_order(order_id: str, crest_url: str) -> None:
     token = load_shopify_admin_token()
@@ -368,9 +376,6 @@ _SIGIL_FILES = sorted(p for p in SIGILS_DIR.glob("*.png") if p.is_file())
 # Image helpers (alpha tinting)
 # =========================================================
 def tint_from_alpha(img: Image.Image, rgb: tuple[int, int, int]) -> Image.Image:
-    """
-    For monochrome-on-transparent assets: use alpha as mask and fill with rgb.
-    """
     img = img.convert("RGBA")
     _, _, _, a = img.split()
     coloured = Image.new("RGBA", img.size, rgb + (255,))
@@ -379,9 +384,6 @@ def tint_from_alpha(img: Image.Image, rgb: tuple[int, int, int]) -> Image.Image:
 
 
 def composite_sigil_on_shield(shield: Image.Image, sigil: Image.Image, rng: random.Random) -> Image.Image:
-    """
-    Conservative one-off variation: slight rotation/scale/offset + occasional mirror.
-    """
     if rng.random() < 0.20:
         sigil = ImageOps.mirror(sigil)
 
@@ -413,11 +415,9 @@ def generate_crest_png_bytes() -> bytes:
         raise RuntimeError("No sigil PNGs found in assets/sigils")
 
     rng = random.Random()
-
-    # Two colourways only
     palettes = [
-        {"shield": (205, 170, 80), "sigil": (15, 15, 15)},     # gold + near-black
-        {"shield": (30, 30, 30), "sigil": (235, 235, 235)},    # charcoal + off-white
+        {"shield": (205, 170, 80), "sigil": (15, 15, 15)},
+        {"shield": (30, 30, 30), "sigil": (235, 235, 235)},
     ]
 
     for _ in range(40):
@@ -472,12 +472,9 @@ def webhook_order_paid():
 
     try:
         png_bytes = generate_crest_png_bytes()
-
-        # Stable object key per order (retries overwrite same file)
         object_key = f"crests/order_{order_id}.png"
         crest_url = upload_png_to_r2(png_bytes, object_key)
 
-        # Write download link to order (for email template)
         add_crest_url_to_order(str(order_id), crest_url)
 
         log.info("Crest generated and attached to order %s", order_id)
