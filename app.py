@@ -9,7 +9,7 @@ import io
 import random
 import secrets
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qsl
 
 from flask import Flask, request, abort, jsonify
 import boto3
@@ -30,7 +30,7 @@ log = logging.getLogger("cult-generator")
 # Environment variables
 # =========================================================
 
-# Shopify webhook verification (HMAC header verification)
+# Shopify webhook verification (X-Shopify-Hmac-Sha256)
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
 
 # Shop domain (used for /install auth URL and Admin API host)
@@ -43,16 +43,13 @@ STRICT_SHOP_LOCK = os.getenv("STRICT_SHOP_LOCK", "0").strip() == "1"
 SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY", "").strip()          # Client ID
 SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET", "").strip()    # Client Secret (often starts shpss_)
 SHOPIFY_SCOPES = os.getenv("SHOPIFY_SCOPES", "read_orders,write_orders").strip()
-SHOPIFY_REDIRECT_URI = os.getenv("SHOPIFY_REDIRECT_URI", "").strip()  # e.g. https://<service>/auth/callback
+SHOPIFY_REDIRECT_URI = os.getenv("SHOPIFY_REDIRECT_URI", "").strip()  # https://<service>/auth/callback
 
 # Shopify API version used for Admin API calls
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-07").strip()
 
 # Where we store OAuth access token (in R2)
-SHOPIFY_TOKEN_R2_KEY = os.getenv(
-    "SHOPIFY_TOKEN_R2_KEY",
-    "secrets/shopify_admin_token.json"
-).strip()
+SHOPIFY_TOKEN_R2_KEY = os.getenv("SHOPIFY_TOKEN_R2_KEY", "secrets/shopify_admin_token.json").strip()
 
 # Cloudflare R2 (S3 compatible)
 R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").strip()
@@ -160,6 +157,10 @@ def r2_object_exists(object_key: str) -> bool:
 
 
 def mark_unique_hash_used(hash_hex: str) -> bool:
+    """
+    Hard guarantee never-repeat: reserve a marker object for the final PNG hash.
+    Returns True if reserved now, False if already exists.
+    """
     key = f"unique/{hash_hex}.txt"
     if r2_object_exists(key):
         return False
@@ -170,50 +171,38 @@ def mark_unique_hash_used(hash_hex: str) -> bool:
 
 
 # =========================================================
-# OAuth helpers (robust raw-query HMAC verification)
+# OAuth helpers (Shopify-canonical HMAC verification)
 # =========================================================
-def _shopify_oauth_hmac_is_valid_raw(query_string: bytes) -> bool:
+def _shopify_oauth_hmac_is_valid(query_string: bytes) -> bool:
     """
-    Verify Shopify OAuth callback HMAC using the RAW query string to avoid
-    any decoding/normalisation differences (e.g. '+' vs '%20').
-
-    Algorithm:
-      - Take query string as sent by Shopify
-      - Remove 'hmac' and 'signature' parameters
-      - Sort remaining parameters by key (lexicographically)
-      - Join as 'key=value' pairs with '&'
-      - Compare hex HMAC-SHA256(secret, message) to received hmac
+    Canonical Shopify OAuth HMAC verification:
+      - parse query string into decoded pairs
+      - remove hmac + signature
+      - sort by key
+      - join as key=value with &
+      - compare hex HMAC-SHA256(secret, message) to received hmac
     """
     if not SHOPIFY_API_SECRET:
         return False
 
     qs = query_string.decode("utf-8", errors="strict")
-    if not qs:
-        return False
+    pairs = parse_qsl(qs, keep_blank_values=True)  # decodes %XX and '+' -> space
 
-    parts = qs.split("&")
     received_hmac = None
-    kv_pairs = []
-
-    for part in parts:
-        if "=" in part:
-            k, v = part.split("=", 1)
-        else:
-            k, v = part, ""
-
+    filtered = []
+    for k, v in pairs:
         if k == "hmac":
             received_hmac = v
             continue
-        if k in ("signature",):
+        if k == "signature":
             continue
-
-        kv_pairs.append((k, v))
+        filtered.append((k, v))
 
     if not received_hmac:
         return False
 
-    kv_pairs.sort(key=lambda x: x[0])
-    message = "&".join([f"{k}={v}" for k, v in kv_pairs])
+    filtered.sort(key=lambda x: x[0])
+    message = "&".join([f"{k}={v}" for k, v in filtered])
 
     digest = hmac.new(
         SHOPIFY_API_SECRET.encode("utf-8"),
@@ -236,6 +225,9 @@ def _save_shopify_token_to_r2(token_payload: dict) -> None:
 
 
 def load_shopify_admin_token() -> str:
+    """
+    Prefer explicit env var if present, otherwise load from R2.
+    """
     tok = os.getenv("SHOPIFY_ADMIN_TOKEN", "").strip()
     if tok:
         return tok
@@ -285,7 +277,7 @@ def shopify_install():
 def shopify_auth_callback():
     """
     OPTION A: no shop-match enforcement.
-    We still enforce: state cookie + raw-query HMAC.
+    We still enforce: state cookie + OAuth HMAC.
     """
     code = request.args.get("code", "")
     shop = request.args.get("shop", "")
@@ -298,8 +290,7 @@ def shopify_auth_callback():
     if not expected_state or not hmac.compare_digest(expected_state, state):
         abort(401, "Invalid OAuth state")
 
-    # RAW query-string verification (fixes your current error)
-    if not _shopify_oauth_hmac_is_valid_raw(request.query_string):
+    if not _shopify_oauth_hmac_is_valid(request.query_string):
         abort(401, "Invalid OAuth HMAC")
 
     token_url = f"https://{shop}/admin/oauth/access_token"
@@ -331,7 +322,7 @@ def shopify_auth_callback():
 
 
 # =========================================================
-# Shopify Admin API helper
+# Shopify Admin API helper (writes crest URL to order)
 # =========================================================
 def add_crest_url_to_order(order_id: str, crest_url: str) -> None:
     token = load_shopify_admin_token()
@@ -415,6 +406,7 @@ def generate_crest_png_bytes() -> bytes:
         raise RuntimeError("No sigil PNGs found in assets/sigils")
 
     rng = random.Random()
+
     palettes = [
         {"shield": (205, 170, 80), "sigil": (15, 15, 15)},
         {"shield": (30, 30, 30), "sigil": (235, 235, 235)},
@@ -472,6 +464,7 @@ def webhook_order_paid():
 
     try:
         png_bytes = generate_crest_png_bytes()
+
         object_key = f"crests/order_{order_id}.png"
         crest_url = upload_png_to_r2(png_bytes, object_key)
 
